@@ -1,0 +1,1244 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r, include = FALSE, echo=FALSE}
+options(warn = -1) 
+library("DescTools")
+library("generalhoslem")
+library('EMT') #for multinomial.test()
+library("ordinal")
+library(superml)
+library("perturb")
+library(MGLM)
+library ( mgcv )
+library(corrplot)
+library(tidyverse)
+library(dplyr)  
+library(boot)
+library(statmod)
+library(Epi)
+library(MASS)
+require(gridExtra)
+require(caret)
+library(ResourceSelection)
+library(corrplot)
+require(nnet)
+library(parallel)
+library ( VGAM )
+library ( caret )
+library(Epi) #ROC
+library(pROC) #multiclass
+library("multiROC")
+library("ISLR") #ploting coeffs
+library(effects)    # for model visualization & more
+library(latex2exp)    # Write latex in plots
+
+
+library(odbc)
+library(RPostgreSQL)
+library(RPostgres)
+library(DBI)
+library(ggplot2)
+
+```
+
+
+```{r}
+
+draw_cm_multiple_class = function(cm, title, frac){
+  # extract the confusion matrix values as data.frame
+  cm_d <- as.data.frame(cm$table)
+  
+  # confusion matrix statistics as data.frame
+  cm_st <-data.frame(cm$overall[1:2])
+  names(cm_st)[names(cm_st) == 'Accuracy'] <- 'Acc'
+
+  # round the values
+  cm_st <- round(cm_st,2)
+  print(cm_st)
+  cm_st['Obs',] = sum(cm[["cm"]][["table"]])
+  # cm_st = data.frame(cm_st[c('Accuracy', 'Kappa' ,'Ovservation'),])
+
+  # here we also have the rounded percentage values
+  cm_p <- as.data.frame(prop.table(cm$table))
+  cm_d$Perc <- round(cm_p$Freq*100,2)
+  # Now we're ready to plot:
+  myColors = rainbow(dim(cm_d)[1])
+  
+  # plotting the matrix
+  cm_d_p <-  ggplot(data = cm_d, aes(x = Prediction , y =  Reference, fill = Freq))+
+    ggtitle(title) +
+    geom_tile() +
+    theme(legend.position="none")+
+    geom_text(aes(label = paste(Perc,"%")), color = 'black', size = 5) +
+    scale_fill_gradient(low="white", high="#009194") +
+    guides(shape = F)
+  
+  # plotting the stats
+   mytheme <- gridExtra::ttheme_default(
+    core = list(fg_params=list(cex = 0.95)),
+    colhead = list(fg_params=list(cex = 0.95),margin= unit(0.4, "cm") ),
+    rowhead = list(fg_params=list(cex = 0.95)),
+    axis.text = element_text(size = rel(0.95), angle = 180 ))
+  cm_st_p <-  tableGrob(cm_st, theme = mytheme)
+  
+  # all together
+  return(grid.arrange(cm_d_p, cm_st_p,nrow = 1, ncol = 2, widths = c(frac/5, (5-frac)/5)))
+  
+} 
+```
+
+
+
+
+
+```{r, include = FALSE, echo=FALSE}
+
+dsn_database = "tfm"   # Specify the name of your Database
+# Specify host name e.g.:"aws-us-east-1-portal.4.dblayer.com"
+dsn_hostname = "localhost"  
+dsn_port = "5432"                # Specify your port number. e.g. 98939
+dsn_uid = "postgres"         # Specify your username. e.g. "admin"
+dsn_pwd = "1889Yanir"
+
+
+db <- 'tfm'  #provide the name of your db
+
+host_db <- 'localhost' #i.e. # i.e. 'ec2-54-83-201-96.compute-1.amazonaws.com'  
+
+db_port <- '5432'  # or any other port specified by the DBA
+
+db_user <- 'postgres'  
+
+db_password <- '1889Yanir'
+
+con <- dbConnect(RPostgres::Postgres(), dbname = db, host=host_db, port=db_port, user=db_user, password=db_password)  
+ 
+dbListTables(con) 
+```
+
+
+```{r, include = FALSE, echo=FALSE}
+q = "
+select a_.year,
+a_.game_id,
+a_.time_marker,
+a_.quarter,
+a_.q_minutes,
+a_.team,
+opponent,
+case
+    when a_.five_on_court = 0 then 1 
+    else a_.five_on_court
+end as oloc,
+a_.score_dif,
+a_.shot_score,
+a_.shot_miss,
+a_.foul_made,
+a_.foul_gain,
+a_.home_away,
+sub_after_shot_by_team,
+sub_after_miss_by_team,
+sub_after_foul,
+cv_score_dif,
+abs(cv_score_dif) as abs_cv_score_dif,
+case
+  when (abs(cv_score_dif) >= 5) then '5Very high'
+  when (abs(cv_score_dif) < 5 and abs(cv_score_dif) >= 2.5) then '4High'
+  when (abs(cv_score_dif) < 2.5 and abs(cv_score_dif) >= 1.5) then '3Mid'
+  when (abs(cv_score_dif) < 1.5 and abs(cv_score_dif) >= 0.5) then '2Low'
+  else '1Very low'
+end as group_cv
+, cluster
+from basket.data_analytics_all_metrics_agg a_
+left join 
+(select distinct year, game_id, time_marker, team,
+case 
+	when (action in ('Entra a Pista','Sale a Banquillo') and action_p_1_by_team in ('Mate','Canasta de 3','Canasta de 2','Canasta de 1')) then 1
+	else 0 	
+end sub_after_shot_by_team,
+case 
+	when (action in ('Entra a Pista','Sale a Banquillo') and action_p_1_by_team in ('Intento fallado de 1', 'Intento fallado de 2','Intento fallado de 3')) then 1
+	else 0 	
+end sub_after_miss_by_team,
+case 
+	when (action in ('Entra a Pista','Sale a Banquillo') and action_p_1_by_team in ('Falta Personal','Falta recibida')) then 1
+	else 0 	
+end sub_after_foul
+from(
+	select year, game_id, play_number, team , time_marker, action
+	, lag(action,-1) over(partition by year, game_id, team order by play_number asc) action_p_1_by_team
+	, lag(action,-1) over(partition by year, game_id order by play_number asc) action_p_1
+	from stg.all_data_info
+	-- where year = 2003
+	where team !='NA'
+	order by 1,2,3 asc
+) as d_
+order by 1,2,3) as b_
+on a_.year = b_.year
+and a_.game_id = b_.game_id
+and a_.time_marker = b_.time_marker
+
+left join 
+basket.score_dif_cv_per_game c_
+on a_.year = c_.year
+and a_.game_id = c_.game_id
+
+left join 
+basket.team_info d_
+on a_.team = d_.team
+
+left join 
+
+(
+select distinct year, game_id, team as opponent , time_marker
+	from stg.all_data_info
+	where year >= 2003
+	and team !='NA'
+	order by 1,2,3 asc
+	
+) as opo
+on a_.year = opo.year
+and a_.game_id = opo.game_id
+and a_.time_marker = opo.time_marker
+and a_.team != opo.opponent
+
+"
+
+df = dbGetQuery(conn = con, q)
+
+```
+
+
+##################################################################################
+#                                        FULL MODEL                              #              
+##################################################################################
+```{r, include = FALSE, echo=FALSE}
+df = df[df$year == 2003,]
+df = df[,c("game_id","time_marker","quarter","q_minutes","team","opponent","oloc","score_dif","shot_score","shot_miss","foul_made","foul_gain","home_away","sub_after_shot_by_team","sub_after_miss_by_team","sub_after_foul","cv_score_dif","group_cv", "cluster" )]
+df$home_away = as.factor(df$home_away)
+df$q_minutes = as.factor(df$q_minutes)
+df$oloc = as.factor(df$oloc)
+df$quarter = as.factor(df$quarter)
+df$team = as.factor(df$team)
+df$opponent = as.factor(df$opponent)
+df$sub_after_shot_by_team = as.factor(df$sub_after_shot_by_team)
+df$sub_after_miss_by_team = as.factor(df$sub_after_miss_by_team)
+df$sub_after_foul = as.factor(df$sub_after_foul)
+df$group_cv = as.factor(df$group_cv)
+df$cluster = as.factor(df$cluster)
+
+df$score_dif = as.numeric(df$score_dif)
+df$time_marker = as.numeric(df$time_marker)
+df$ cv_score_dif = as.numeric(df$cv_score_dif)
+# df$abs_cv_score_dif = as.numeric(df$ abs_cv_score_dif)
+df$shot_score = as.numeric(df$shot_score)
+df$shot_miss = as.numeric(df$shot_miss)
+df$foul_made = as.numeric(df$foul_made)
+df$foul_gain = as.numeric(df$foul_gain)
+
+col_num = c('score_dif'
+,'time_marker'
+,'cv_score_dif'
+# ,'abs_cv_score_dif'
+,'shot_score'
+,'shot_miss'
+,'foul_made'
+,'foul_gain')
+
+df = df[!rowSums(is.na(df)) > 0,]
+
+
+categorical_var = c('home_away',
+                    'q_minutes',
+                    'oloc',
+                    'quarter',
+                    'team',
+                    'opponent',
+                    'sub_after_shot_by_team',
+                    'sub_after_miss_by_team',
+                    'sub_after_foul',
+                    'group_cv',
+                    'cluster')
+
+
+num_var = c('score_dif',
+            'cv_score_dif',
+            'shot_score',
+            'shot_miss',
+            'foul_made',
+            'foul_gain')
+```
+
+
+
+VISUALIZATION
+
+```{r}
+summary(df)
+```
+
+
+Corr
+```{r, include = FALSE, echo=FALSE}
+png("numerical correlation.png")
+corrplot(cor(df[,num_var]))
+```
+
+
+```{r, include = FALSE, echo=FALSE}
+par(mfrow = c(1,2))
+plot(df$oloc, df$sub_after_shot_by_team )
+plot(df$oloc, df$sub_after_miss_by_team )
+plot(df$oloc, df$sub_after_foul )
+plot(df$oloc, df$group_cv )
+plot(df$q_minutes,df$oloc, col = df$group_cv )
+```
+
+
+```{r}
+# LAPLCE FIT
+temp = unique(df[abs(df$cv_score_dif) < 30, 'cv_score_dif'])
+
+m = median(temp)
+t = mean(abs(temp-m))
+png('cv_with_laplce.png')
+hist(temp, prob=TRUE, ylim = c(0, 0.27), main = 'Histogram with Laplce Fit', xlab = 'CV values', breaks = 20, border = "coral", col = 'grey') 
+lines(min(temp):max(temp), dlaplace(min(temp):max(temp), location =  median(temp), scale=mean(abs(temp-median(temp)))), col = 'red')
+text(-15, 0.23, TeX(sprintf(r'($x \sim Lap(\mu,\tau)$)')))
+text(-15, 0.2, TeX(sprintf(r'($\hat{\mu} = %f$)',  round(m,2))))
+text(-15, 0.17, TeX(sprintf(r'($\hat{\tau} = %f$)',  round(t,2))))
+```
+
+
+
+  
+```{r, include = FALSE, echo=FALSE}
+set.seed(42)
+
+mod_col = c(categorical_var,num_var)
+
+
+model_df = df[,mod_col]
+# train test
+splInd = createDataPartition(model_df$oloc, p = 0.9, list = FALSE)
+df_train = model_df[splInd,]
+df_test = model_df[-splInd,]
+
+# x train, x val
+splIndVal = createDataPartition(df_train$oloc, p = 0.9, list = FALSE)
+train = df_train[splIndVal,]
+val = df_train[-splIndVal,]
+
+```
+
+
+Multinomial
+
+```{r, include = FALSE, echo=FALSE}
+
+first_mul_model <- multinom(oloc ~ quarter
+                 + q_minutes
+                 + score_dif
+                 + shot_score
+                 + shot_miss
+                 + foul_made
+                 + foul_gain
+                 + home_away
+                 + cluster
+                 + sub_after_shot_by_team
+                 + sub_after_miss_by_team
+                 + sub_after_foul
+                 + cv_score_dif
+                 + group_cv
+                 + quarter:q_minutes
+                 + quarter:score_dif
+                 + quarter:cluster
+                 + quarter:home_away
+                 + quarter:cv_score_dif
+                 + quarter:group_cv
+                 + quarter:shot_score
+                 + quarter:shot_miss
+                 + quarter:foul_made
+                 + quarter:sub_after_shot_by_team
+                 + quarter:sub_after_miss_by_team
+                 + quarter:sub_after_foul
+                 , data = train)
+
+stepAIC(first_mul_model,direction="both",trace=FALSE)
+
+primary_multi_modl <-multinom(formula = oloc ~  quarter + q_minutes + score_dif + shot_score + 
+                                                shot_miss + foul_made + foul_gain + home_away + cluster + 
+                                                sub_after_shot_by_team + sub_after_miss_by_team + sub_after_foul + 
+                                                cv_score_dif + group_cv + quarter:q_minutes + quarter:score_dif + 
+                                                quarter:cluster + quarter:group_cv + quarter:shot_score + 
+                                                quarter:shot_miss + quarter:foul_made + quarter:sub_after_shot_by_team + 
+                                                quarter:sub_after_miss_by_team + quarter:sub_after_foul, data = train)
+
+
+multi_summary = summary(primary_multi_modl)
+multi_coeff = multi_summary[["coefficients"]]
+# To calculate the Coeff significant with wald z test
+z <- multi_coeff/multi_summary$standard.errors
+p <- (1 - pnorm(abs(z), 0, 1)) * 2
+p
+
+# Removing shot miss
+primary_multi_modl <-multinom(formula = oloc ~  quarter + q_minutes + score_dif + shot_score  
+                                                 + foul_made + foul_gain + home_away + cluster + 
+                                                sub_after_shot_by_team + sub_after_miss_by_team + sub_after_foul + 
+                                                cv_score_dif + group_cv + quarter:q_minutes + quarter:score_dif + 
+                                                quarter:cluster + quarter:group_cv + quarter:shot_score + 
+                                                quarter:foul_made + quarter:sub_after_shot_by_team + 
+                                                quarter:sub_after_miss_by_team + quarter:sub_after_foul, data = train)
+
+
+multi_summary = summary(primary_multi_modl)
+multi_coeff = multi_summary[["coefficients"]]
+z <- multi_coeff/multi_summary$standard.errors
+p <- (1 - pnorm(abs(z), 0, 1)) * 2
+p
+
+
+# Removing shot score, 
+primary_multi_modl <-multinom(formula = oloc ~  quarter + q_minutes + score_dif + foul_made + foul_gain +
+                                                home_away + cluster + sub_after_shot_by_team + sub_after_miss_by_team +
+                                                sub_after_foul +  cv_score_dif + group_cv + quarter:q_minutes +
+                                                quarter:score_dif +  quarter:cluster + quarter:group_cv +
+                                                quarter:foul_made + quarter:sub_after_shot_by_team +
+                                                quarter:sub_after_miss_by_team + quarter:sub_after_foul, data = train)
+
+
+multi_summary = summary(primary_multi_modl)
+multi_coeff = multi_summary[["coefficients"]]
+z <- multi_coeff/multi_summary$standard.errors
+p <- (1 - pnorm(abs(z), 0, 1)) * 2
+p
+
+
+# Removing score dif 
+primary_multi_modl <-multinom(formula = oloc ~  quarter + q_minutes + foul_made + foul_gain +
+                                                home_away + cluster + sub_after_shot_by_team + sub_after_miss_by_team +
+                                                sub_after_foul +  cv_score_dif + group_cv + quarter:q_minutes +
+                                                quarter:cluster + quarter:group_cv + quarter:foul_made +
+                                                quarter:sub_after_shot_by_team + quarter:sub_after_miss_by_team +
+                                                quarter:sub_after_foul, data = train)
+
+multi_summary = summary(primary_multi_modl)
+multi_coeff = multi_summary[["coefficients"]]
+z <- multi_coeff/multi_summary$standard.errors
+p <- (1 - pnorm(abs(z), 0, 1)) * 2
+p
+exp(multi_coeff)
+
+
+# The confidance interval of the model features
+mymodel_confi = exp(confint(primary_multi_modl, method="profile"))
+mymodel_confi_exp = data.frame(mymodel_confi)
+mymodel_confi = confint(primary_multi_modl, method="profile")
+mymodel_confi = data.frame(mymodel_confi)
+
+
+
+
+```
+
+
+
+predict
+```{r, include = FALSE, echo=FALSE}
+train_pred<- predict(primary_multi_modl, newdata = train, "class")
+val_pred<- predict(primary_multi_modl, newdata = val, "class")
+
+print("CM result of the Train set")
+confusionMatrix(train$oloc, train_pred)
+
+print("CM result of the validation set")
+cm_f_model = confusionMatrix(val$oloc, val_pred)
+
+print("CM result of the Dummy prediction set")
+bm_val = ceiling(runif(5916, 0, 5))
+confusionMatrix(val$oloc, as.factor(bm_val))
+
+png("Confusion Matrix Model.png")
+draw_cm_multiple_class(cm_f_model, 'Model Confusion Matrix', 3.5)
+
+
+cm_temp = cal_confus(as.numeric(val$oloc), bm_val)
+
+t = as.numeric(val$oloc)
+to<- predict(primary_multi_modl, newdata = val, "probs")
+logitgof(t,to, g = 15, ord = FALSE)
+```
+
+
+```{r}
+# Plot roc curves 1 vs 1
+
+col_plate = rainbow(10)
+leg = c()
+for (j in 1:length(rs)){
+  name = paste0(rs[[j]][["levels"]][1],'-', rs[[j]][["levels"]][2])
+  leg = c(leg, name)
+}
+roc.multi = multiclass.roc(as.numeric(val$oloc), as.numeric(val_pred))
+rs <- roc.multi[['rocs']]
+
+
+# png("Multiclass Roc Curves First Model.png")
+plot.roc(rs[[1]],col = col_plate[1], main= 'Multiclass Roc Curves')
+sapply(2:length(rs),function(i) lines.roc(rs[[i]],col=col_plate[i]))
+legend(0.6,0.4,legend = leg, fill = col_plate[1:length(rs)], ncol = 3 )
+
+
+```
+
+```{r}
+temp = allEffects(primary_multi_modl)
+
+
+png("quarter_fouls_effect.png")
+plot(temp$`quarter:foul_made`, 
+     lines = list(multiline = T) 
+     , confint = list(style = "bands")
+     , rows = 2, cols = 1)
+
+
+
+# "auto", "bars", "lines", "bands", "none"
+```
+
+
+
+##################################################################################
+#                                 Ordinal Application Per group                  #              
+##################################################################################
+
+
+```{r}
+
+team_list = unique(df$team)
+# team_list = setdiff(team_list,'BAR')
+# team_list = setdiff(team_list,'BRE')
+# team_list = setdiff(team_list,'BAS')
+# team_list = setdiff(team_list,'ALI')# NOT MODELIZED
+# team_list = setdiff(team_list,'GIR')
+# team_list = setdiff(team_list,'JOV')
+# team_list = setdiff(team_list,'MAD')# NOT MODELIZED
+# team_list = setdiff(team_list,'LLE')
+# team_list = setdiff(team_list,'RON')# NOT MODELIZED
+# team_list = setdiff(team_list,'VAL')
+# team_list = setdiff(team_list,'TNF')
+# team_list = setdiff(team_list,'EST')# NOT MODELIZED
+# team_list = setdiff(team_list,'MUR')
+# team_list = setdiff(team_list,'FUE')
+# team_list = setdiff(team_list,'MAN')# NOT MODELIZED
+# team_list = setdiff(team_list,'SEV')
+# team_list = setdiff(team_list,'PAM')# NOT MODELIZED
+
+
+model_lst = list()
+
+for (group in team_list){
+  
+  traintemp = train[train$team == group,]
+  valtemp = train[train$team == group,]
+  print(paste0('################\n this is ', group, '###############'))
+  model = multinom(oloc ~quarter
+                 + sub_after_shot_by_team
+                 + sub_after_miss_by_team
+                 + sub_after_foul
+                 + cluster
+                 + group_cv
+                 + score_dif
+                 + cv_score_dif
+                 + shot_score
+                 + foul_made
+                 + opponent
+                 + quarter:q_minutes
+                 + quarter:score_dif
+                 + quarter:home_away
+                 + quarter:cv_score_dif
+                 + quarter:group_cv
+                 + quarter:shot_score
+                 + quarter:shot_miss
+                 + quarter:foul_made
+                 + quarter:sub_after_shot_by_team
+                 + quarter:sub_after_miss_by_team
+                 + quarter:sub_after_foul
+                 + group_cv:score_dif
+                 + group_cv:cv_score_dif
+                 + group_cv:foul_made
+              , data=traintemp)
+  step_ = stepAIC(model)
+  model = multinom(step_[["terms"]], data=traintemp)
+  model_to_lst = list()
+  model_to_lst[[group]] = model
+  model_lst = c(model_lst, model_to_lst)  
+}
+
+
+
+```
+
+Goodness of fit
+```{r}
+
+for (group in names(model_lst)){
+  print(group)
+  # if (group == 'BAR'){model = bar_model
+  # }else if (group == 'BAS'){model = bas_model
+  # }else if (group == 'BRE'){model = bre_model
+  # }else if (group == 'ALI'){model = ali_model
+  # }else if (group == 'JOV'){model = jov_model
+  # }else if (group == 'LLE'){model = lle_model
+  # }else if (group == 'TNF'){model = tnf_model
+  # }else if (group == 'VAL'){model = val_model
+  # }else if (group == 'MUR'){model = mur_model
+  # }else if (group == 'FUE'){model = fue_model
+  # }else if (group == 'SEV'){model = sev_model
+  # }else if (group == 'PAM'){ model = pam_model
+  # }else if (group == 'GIR'){ model = gir_model
+  # }else if (group == 'MAN'){ model = man_model
+  # }else if (group == 'MAD'){ model = mad_model
+  # }else if (group == 'RON'){ model = ron_model
+  # }else if (group == 'EST'){ model = est_model
+  # }else model = cla_model
+  model_ = model_lst[[group]]
+  d = model_[["deviance"]]
+  resi = model_[["residuals"]] 
+  print(1 - pchisq(d, resi))
+  
+}
+
+temp = train[train$team == 'PAM',]
+
+chisq.test(train$oloc,predict(model_lst[[group]], newdata = train, "class"))
+
+PseudoR2(model_lst[[group]], which = c("CoxSnell","Nagelkerke","McFadden"))
+
+```
+
+
+compare result
+
+```{r}
+# Use cal_confus, which will get you the CM kpi's, so you could average them (library("multiROC"))
+
+pred = c()
+pred_probs = c()
+true_val_test = c()
+true_val = c()
+
+
+cm_lst = list(
+'BAR' = '' ,
+'BAS' = '' ,
+'BRE' = '' ,
+'ALI' = '' ,
+'JOV' = '' ,
+'LLE' = '' ,
+'TNF' = '' ,
+'VAL' = '' ,
+'MUR' = '' ,
+'FUE' = '' ,
+'SEV' = '' ,
+'PAM' = '',
+'GIR' = '',
+'MAN' = '',
+'MAD' = '',
+'RON' = '',
+'EST' = '',
+'CLA' = '')
+
+accuracy_lst = c() 
+kappa_lst = c()
+
+for (group in names(model_lst)){
+  # print(group)
+  temp = val[val$team == group,]
+  pred_group_model = predict(model_lst[[group]], newdata = temp, "class")
+  pred = c(pred, pred_group_model)
+  pred_probs_group_model = predict(model_lst[[group]], newdata = temp, "probs")
+  pred_probs = rbind(pred_probs, pred_probs_group_model)
+  true_val = c(true_val, temp$oloc)
+  # true_val_test
+  
+  pred_model = predict(primary_multi_modl, newdata = temp, "class")
+  
+ temp['diff_pred_real_group'] = as.numeric(temp$oloc) - as.numeric(pred_group_model)
+ temp['diff_pred_real'] =as.numeric(temp$oloc) - as.numeric(pred_model)
+  
+ temp_grouped <- temp %>% group_by(time_marker)%>% summarise(mean_diff_pred_real_group = mean(diff_pred_real_group)
+                                                             , mean_diff_pred_real = mean(diff_pred_real)
+                                                             , mean_oloc = mean(as.numeric(oloc))
+                                                            )
+  
+  plot(temp_grouped$mean_oloc, col = 2, type= 'b', pch = 16, ylim = c(-5,5), main=group)
+  points(temp_grouped$mean_diff_pred_real_group, col = 3, type= 'b', pch = 20)
+  points(temp_grouped$mean_diff_pred_real, col = 4, type= 'b', pch = 21)
+  # abline(h=sd(temp_grouped$mean_predd_sd))
+  # abline(h=-sd(temp_grouped$mean_predd_sd))
+  abline(h=0, col=5)
+  
+  print(paste0("Res for ", group , ' is: ', round(mean(as.numeric(temp$oloc) - as.numeric(pred_group_model)),4), ' vs: ', round(mean(as.numeric(temp$oloc) - as.numeric(pred_model)),4)))
+  
+  
+  print(paste0("##################", group ,"#############"))
+  pred_group_model = as.factor(pred_group_model)
+  # pred_group_model = factor(pred_group_model, levels =  c(1,2,3,4,5))
+  cm_h = confusionMatrix(temp$oloc, pred_group_model)
+  print(cm_h[["overall"]][["Accuracy"]])
+  print(cm_h[["overall"]][["Kappa"]])
+  # cm_lst[group] = cm_h
+  
+  accuracy_lst = c(accuracy_lst, cm_h[["overall"]][["Accuracy"]])
+  kappa_lst = c(kappa_lst, cm_h[["overall"]][["Kappa"]])
+  cm_lst[group] = cm_h
+  }
+
+
+
+```
+
+```{r}
+
+mean(accuracy_lst)
+sd(accuracy_lst)
+
+mean(kappa_lst)
+sd(kappa_lst)
+
+
+t = as.numeric(val$oloc)
+logitgof(true_val, pred_probs, g = 15, ord = FALSE)
+```
+
+
+Total CM
+```{r}
+
+cm_new_model = confusionMatrix(as.factor(true_val), as.factor(pred))
+png('cm new model.png')
+draw_cm_multiple_class(cm_new_model, 'New Model Confusion Matrix', 3.5)
+# cm_temp = cal_confus(as.numeric(val$oloc), bm_val)
+
+cm_new_model
+
+
+col_plate = rainbow(10)
+leg = c()
+for (j in 1:length(rs)){
+  name = paste0(rs[[j]][["levels"]][1],'-', rs[[j]][["levels"]][2])
+  leg = c(leg, name)
+}
+roc.multi = multiclass.roc(true_val, as.numeric(pred))
+rs <- roc.multi[['rocs']]
+
+
+# png("Multiclass Roc Curves First New Model.png")
+plot.roc(rs[[1]],col = col_plate[1], main= 'Multiclass Roc Curves(new model)')
+sapply(2:length(rs),function(i) lines.roc(rs[[i]],col=col_plate[i]))
+legend(0.6,0.4,legend = leg, fill = col_plate[1:length(rs)], ncol = 3 )
+```
+
+
+
+
+##################################################################################
+#                                        Only TIME VARIABLES                     #              
+##################################################################################
+
+```{r, include = FALSE, echo=FALSE}
+
+model_time <- multinom(oloc ~ + score_dif
+                 + shot_score
+                 + shot_miss
+                 + foul_made
+                 + foul_gain
+                 + home_away
+                 + sub_after_shot_by_team
+                 + sub_after_miss_by_team
+                 + sub_after_foul
+                 + cv_score_dif
+                 + group_cv
+                 , data = train)
+
+model_time_sum = summary(model_time)
+model_time_coeff = model_time_sum[["coefficients"]]
+
+
+# To calculate the Coeff significant with wald z test
+z_time <- model_time_coeff/model_time_sum$standard.errors
+p_time <- (1 - pnorm(abs(z), 0, 1)) * 2
+exp(model_time_coeff)
+
+
+```
+
+predict
+```{r, include = FALSE, echo=FALSE}
+# Train
+# Predicting the values for train dataset
+val_time_pred<- predict(model_time, newdata = val, "class")
+
+# Building classification table
+tabtime <- table(val$oloc, val_time_pred)
+
+# Calculating accuracy - sum of diagonal elements divided by total obs
+round((sum(diag(tabtime))/sum(tabtime))*100,2)
+
+cm = confusionMatrix(val$oloc, val_time_pred)
+temp = data.frame(cm[["byClass"]])
+
+# Predicting the values for train dataset
+val_time_pred<- predict(model_time, newdata = val, "class")
+
+# Building classification table
+tabtime <- table(val$oloc, val_time_pred)
+
+# Calculating accuracy - sum of diagonal elements divided by total obs
+round((sum(diag(tabtime))/sum(tabtime))*100,2)
+
+cm = confusionMatrix(val$oloc, val_time_pred)
+temp = data.frame(cm[["byClass"]])
+
+
+```
+
+
+
+##################################################################################
+#                                 HIGH/LOW SCORE DIF GAMES                       #              
+##################################################################################
+
+
+
+```{r, include = FALSE, echo=FALSE}
+h_model_df = train[train$group_cv == "Very high",]
+l_model_df = train[train$group_cv == "Very low",]
+
+##### HIGH
+h_model_test <- multinom(oloc ~  quarter
+                             + q_minutes
+                             + score_dif
+                             + shot_score
+                             + shot_miss
+                             + foul_made
+                             + foul_gain
+                             + home_away
+                             + sub_after_shot_by_team
+                             + sub_after_miss_by_team
+                             + sub_after_foul
+                             + cv_score_dif
+                             + quarter:q_minutes
+                             + quarter:score_dif
+                             + home_away:score_dif
+                             + home_away:shot_score
+                             + home_away:shot_miss
+                             + home_away:foul_made
+                             + home_away:foul_gain
+                             + q_minutes:foul_made
+                             + q_minutes:foul_made
+                             , data = h_model_df)
+
+stepAIC(h_model_test,direction="backward",trace=FALSE)
+h_model <-multinom(formula = oloc ~ quarter + q_minutes  + foul_gain + home_away + sub_after_miss_by_team + cv_score_dif + quarter:q_minutes +foul_gain:home_away + q_minutes:foul_made, data = h_model_df)
+
+h_model_sum = summary(h_model)
+h_model_coeff = h_model_sum[["coefficients"]]
+
+# To calculate the Coeff significant with wald z test
+z_h <- h_model_coeff/h_model_sum$standard.errors
+p_h <- (1 - pnorm(abs(z_h), 0, 1)) * 2
+exp(h_model_coeff)
+
+
+
+##### LOW
+l_model_test <- multinom(oloc ~  quarter
+                             + q_minutes
+                             + score_dif
+                             + shot_score
+                             + shot_miss
+                             + foul_made
+                             + foul_gain
+                             + home_away
+                             + sub_after_shot_by_team
+                             + sub_after_miss_by_team
+                             + sub_after_foul
+                             + cv_score_dif
+                             + quarter:q_minutes
+                             + quarter:score_dif
+                             + home_away:score_dif
+                             + home_away:shot_score
+                             + home_away:shot_miss
+                             + home_away:foul_made
+                             + home_away:foul_gain
+                             + q_minutes:foul_made
+                             + q_minutes:foul_made
+                             , data = l_model_df)
+
+stepAIC(l_model_test,direction="backward",trace=FALSE)
+
+# Not significant - scire miss, sub_after_miss_by_team1, shot_miss:home_away, foul_gain:home_away 
+l_model <-multinom(formula = oloc ~ quarter + q_minutes + score_dif + 
+    foul_made + foul_gain + home_away  + sub_after_foul + cv_score_dif + quarter:q_minutes + score_dif:home_away  + foul_made:home_away + 
+    q_minutes:foul_made, data = l_model_df)
+
+l_model_sum = summary(l_model)
+l_model_coeff = l_model_sum[["coefficients"]]
+
+
+# To calculate the Coeff significant with wald z test
+z_l <- l_model_coeff/l_model_sum$standard.errors
+p_l <- (1 - pnorm(abs(z_l), 0, 1)) * 2
+exp(l_model_coeff)
+
+```
+
+predict
+```{r, include = FALSE, echo=FALSE}
+### HIGH
+# Predicting the values for train dataset
+h_pred<- predict(h_model, newdata = val, "class")
+
+# Building classification table
+h_tabtime <- table(val$oloc, h_pred)
+
+cm_h = confusionMatrix(val$oloc, h_pred)
+
+### LOW
+# Predicting the values for train dataset
+l_pred<- predict(l_model, newdata = val, "class")
+
+# Building classification table
+l_tabtime <- table(val$oloc, l_pred)
+
+cm_l = confusionMatrix(val$oloc, l_pred)
+
+cm_h
+cm_l
+
+# 
+
+```
+
+
+
+
+##################################################################################
+#                                 Ordinal Application                            #              
+##################################################################################
+
+Multicolinearity
+
+```{r}
+# Conditioned number and variance decomposition proportion category
+cd_numeric <- colldiag(train[,num_var], scale = TRUE, center = FALSE, add.intercept = TRUE)
+print(cd_numeric, fuzz=.5)
+```
+
+
+```{r}
+# Conditioned number and variance decomposition proportion numericaly
+lbl = LabelEncoder$new()
+lbl$fit(train[,categorical_var])
+
+train_cat_labaled = train[,categorical_var]
+
+for (i in categorical_var){
+  train_cat_labaled[,i] = lbl$fit_transform(train[,i])  
+}
+
+
+cd_cat <- colldiag(train_cat_labaled[,categorical_var], scale = TRUE, center = FALSE)
+print(cd_cat, fuzz=.5)
+```
+
+Only categories
+```{r}
+train_ = train
+train_$oloc = as.ordered(train_$oloc)
+val$oloc = as.ordered(val$oloc)
+
+            
+# StepAIC - foul_gain, quarter:score_dif, group_cv:foul_gain, group_cv:shot_score
+# Low significant test - shot_miss
+model_1 = vglm(oloc ~ quarter
+                 + sub_after_shot_by_team
+                 + sub_after_miss_by_team
+                 + sub_after_foul
+                 + group_cv
+                 + cluster
+                 + score_dif
+                 + time_marker
+                 + cv_score_dif
+                 + shot_score
+                 + foul_made
+                 + quarter:sub_after_shot_by_team
+                 + quarter:sub_after_miss_by_team
+                 + quarter:sub_after_foul
+                 + quarter:group_cv
+                 + quarter:cluster
+                 + group_cv:score_dif
+                 + group_cv:cv_score_dif
+                 + group_cv:foul_made,
+               family = cumulative ( parallel = TRUE ) , data=train_, model=TRUE)
+# step = step4(model_1)
+
+sum_model1 = summary(model_1)
+
+# Low significant -  group_cv:shot_score,group_cv:foul_made
+# Fell at the anova test - shot_miss
+model_2 =  vglm(oloc ~ quarter
+                 + sub_after_shot_by_team
+                 + sub_after_miss_by_team
+                 + sub_after_foul
+                 + group_cv
+                 + score_dif
+                 + time_marker
+                 + cv_score_dif
+                 + shot_score
+                 + foul_made
+                 + team
+                 + quarter:sub_after_shot_by_team
+                 + quarter:sub_after_miss_by_team
+                 + quarter:sub_after_foul
+                 + quarter:group_cv
+                 + group_cv:score_dif
+                 + group_cv:cv_score_dif,
+               family = cumulative ( parallel = TRUE ) , data=train_, model=TRUE)
+
+sum_model2 = summary(model_2)
+
+
+model_po_sum
+
+anova(model_1)
+anova(model_2 )
+
+
+g2 = deviance(model_1)
+df = df.residual(model_1)
+1 - pchisq(g2, df)
+
+
+g22 = deviance(model_2)
+df2 = df.residual(model_2)
+1 - pchisq(g22, df2)
+
+
+pr2 <- profile(model_2, alpha=1e-4)
+R> plot(pr2)
+```
+
+
+```{r}
+
+h_pred<- predict(model_2, newdata = val, "response")
+# probs
+
+h_pred = apply(h_pred, 1, which.max)
+# h_pred[2] = 1
+
+# Building classification table
+h_tabtime <- table(predicted = h_pred,actual = val$oloc)
+
+h_pred = as.ordered(h_pred)
+
+cm_h = confusionMatrix(val$oloc, h_pred)
+cm_h
+```
+
+
+PREDICT BY GAME
+
+```{r}
+game_1 = df[df$game_id == 1,]
+
+
+game_1_pred<- predict(model_2, newdata = game_1, "response")
+# probs
+
+game_1_pred = apply(game_1_pred, 1, which.max)
+
+plot(game_1_pred, col = 2, type= 'b', pch = 16)
+points(game_1$oloc, col = 3, type= 'b', pch = 22)
+
+
+plot(game_1_pred - as.numeric(game_1$oloc), col = 2, type= 'b', pch = 16,  ylim = c(-5,5))
+
+
+```
+
+calc the average diff deviation by minutes
+
+
+```{r}
+
+all_game_pred<- predict(model_2, newdata = df, "response")
+all_game_pred = apply(all_game_pred, 1, which.max)
+df['pred'] = all_game_pred
+
+df['diff_pred_real'] = as.numeric(df$oloc) - df['pred']
+
+
+temp <- df %>% group_by(time_marker)%>% summarise(mean_predd_sd = mean(diff_pred_real)
+                                                  , mean_oloc = mean(as.numeric(oloc))
+                                                  )
+
+plot(temp$mean_oloc, col = 2, type= 'b', pch = 16, ylim = c(-5,5))
+points(temp$mean_predd_sd, col = 3, type= 'b', pch = 20)
+
+
+
+
+```
+
+
+By GROUP
+
+
+calc the average diff deviation by minutes
+
+
+```{r}
+
+for (group in unique(df$team)){
+  temp = df[df$team == group,]
+  pred_group = predict(model_2, newdata = temp, "response")
+  pred_group = apply(pred_group, 1, which.max) 
+  temp['diff_pred_real'] = as.numeric(temp$oloc) - temp['pred']
+  
+  temp_grouped <- temp %>% group_by(time_marker)%>% summarise(mean_predd_sd = mean(diff_pred_real)
+                                                    , mean_oloc = mean(as.numeric(oloc))
+                                                    )
+  
+  plot(temp_grouped$mean_oloc, col = 2, type= 'b', pch = 16, ylim = c(-5,5), main=group)
+  points(temp_grouped$mean_predd_sd, col = 3, type= 'b', pch = 20)
+  abline(h=sd(temp_grouped$mean_predd_sd))
+  abline(h=-sd(temp_grouped$mean_predd_sd))
+  abline(h=0, col=5)
+  
+}
+# 
+# 
+# all_game_pred<- predict(model_2, newdata = df, "response")
+# all_game_pred = apply(all_game_pred, 1, which.max)
+# df['pred'] = all_game_pred
+# 
+# df['diff_pred_real'] = as.numeric(df$oloc) - df['pred']
+# 
+# 
+# temp <- df %>% group_by(time_marker)%>% summarise(mean_predd_sd = mean(diff_pred_real)
+#                                                   , mean_oloc = mean(as.numeric(oloc))
+#                                                   )
+# 
+# plot(temp$mean_oloc, col = 2, type= 'b', pch = 16, ylim = c(-5,5))
+# points(temp$mean_predd_sd, col = 3, type= 'b', pch = 20)
+# 
+# 
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# y = t
+# y_hat_ = to
+y = true_val
+y_hat_ = pred_probs
+
+
+yhat <- as.data.frame(y_hat_)
+qq <- unique(quantile(1 - yhat[, 1], probs = seq(0, 1, 1/5)))
+
+cutyhats <- cut(1 - yhat[, 1], breaks = qq, include.lowest = TRUE)
+
+dfobs <- data.frame(y, cutyhats)
+
+dfobsmelt <- melt(dfobs, id.vars = 2)
+
+observed <- cast(dfobsmelt, cutyhats ~ value, length)
+
+names(observed)[names(observed) != "cutyhats"] <- paste0("y_", names(observed)[names(observed) != "cutyhats"])
+
+observed <- observed[order(c(1, names(observed[, 2:ncol(observed)])))]
+
+dfexp <- data.frame(yhat, cutyhats)
+
+dfexpmelt <- melt(dfexp, id.vars = ncol(dfexp))
+
+expected <- cast(dfexpmelt, cutyhats ~ variable, sum)
+
+expected <- expected[order(c(1, names(expected[, 2:ncol(expected)])))]
+names(expected)[names(expected) != "cutyhats"] <- paste0("y_", 
+  names(expected)[names(expected) != "cutyhats"])
+
+PARAMETER <- (nrow(expected) - 2) * (ncol(yhat) - 
+        1) + ncol(yhat)-1
+
+chisq <- sum((observed[, 2:ncol(observed)] - expected[, 
+      2:ncol(expected)])^2/expected[, 2:ncol(expected)])-1.506175e+02
+
+1 - pchisq(chisq, PARAMETER)
+
+plot(expected[,'y_X1'], observed[,'y_1'])
+plot(expected[,'y_X2'], observed[,'y_2'])
+plot(expected[,'y_X3'], observed[,'y_3'])
+plot(expected[,'y_X4'], observed[,'y_4'])
+plot(expected[,'y_X5'], observed[,'y_5'])
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
