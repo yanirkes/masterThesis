@@ -1,0 +1,8 @@
+/ml_models/
+/df_for_ml_after_shuffle.csv
+/FTTransformer_results.csv
+/model.png
+/playground.py
+/pca.png
+/.idea
+/thesis_venv
