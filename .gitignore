@@ -6,6 +6,5 @@
 /pca.png
 /.idea
 /thesis_venv
-research/poisson_regression.py
-research/deep_learning.py
 tempppp.py
+/research/to_ignore/
